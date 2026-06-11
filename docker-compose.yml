@@ -1,0 +1,37 @@
+services:
+  # 1. 关系型数据库：MySQL 8.0（用于存储租户信息、会话长记忆标签和工单）
+  mysql:
+    image: mysql:8.0
+    container_name: saas_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password_123
+      MYSQL_DATABASE: ecommerce_saas
+    ports:
+      - "3307:3306"
+    volumes:
+      # 严格使用相对路径挂载，确保所有数据库数据落在项目文件夹内，不占系统盘
+      - ./data/mysql:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+
+  # 2. 高速缓存：Redis（用于滑动窗口限流、高频 FAQ 缓存、5轮短期记忆）
+  redis:
+    image: redis:7.2-alpine
+    container_name: saas_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    command: redis-server --appendonly yes
+
+  # 3. 向量数据库：Qdrant（用于商户专属 RAG 知识库检索）
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: saas_qdrant
+    restart: always
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant:/qdrant/storage

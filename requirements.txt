@@ -1,0 +1,25 @@
+# 1. 核心 Web 框架与服务器
+fastapi>=0.111.0
+uvicorn>=0.30.1
+
+# 2. 数据库 ORM 与异步驱动
+SQLAlchemy>=2.0.30
+aiomysql>=0.2.0
+cryptography>=42.0.7
+
+# 3. 缓存与向量库客户端
+redis>=5.0.5
+qdrant-client>=1.9.0
+
+# 4. AI Agent 与大模型生态
+langgraph>=0.0.60
+langchain-core>=0.2.5
+langchain-openai>=0.1.8
+
+# 5. 前端沙盒可视化
+streamlit>=1.35.0
+
+# 6. 其他工具
+pydantic>=2.7.2
+python-dotenv>=1.0.1
+httpx>=0.27.0
