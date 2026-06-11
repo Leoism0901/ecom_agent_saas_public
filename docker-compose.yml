@@ -1,3 +1,5 @@
+
+##开源配置
 services:
   # 1. 关系型数据库：MySQL 8.0（用于存储租户信息、会话长记忆标签和工单）
   mysql:
@@ -5,13 +7,15 @@ services:
     container_name: saas_mysql
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: root_password_123
-      MYSQL_DATABASE: ecommerce_saas
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
     ports:
       - "3307:3306"
     volumes:
       # 严格使用相对路径挂载，确保所有数据库数据落在项目文件夹内，不占系统盘
       - ./data/mysql:/var/lib/mysql
+      # MySQL 首次启动时自动执行 init.sql 完成建库建表与测试数据预置（仅在数据目录为空时触发）
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql
     command: --default-authentication-plugin=mysql_native_password
 
   # 2. 高速缓存：Redis（用于滑动窗口限流、高频 FAQ 缓存、5轮短期记忆）

@@ -1,17 +1,73 @@
-# 排除所有数据库、缓存和向量库在本地运行产生的物理数据
+# === 数据库、缓存和向量库数据 ===
 data/
+chroma_db/
+qdrant_data/
+faiss_index/
+vector_store/
 
-# 排除 Python 运行产生的字节码缓存
+# === Python 运行缓存 ===
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
+.tox/
+.nox/
+.coverage
+*.coverage
+htmlcov/
 
-# 排除本地环境变量敏感文件
+# === 敏感配置文件 ===
 .env
+.env.local
+.env.dev
+.env.test
+.env.prod
+!.env.example
+init.sql
+*.secret
+*.pem
+*.key
+private_prompt.txt
 
-# 排除虚拟环境目录（如果是本地建的env）
+# === 虚拟环境 ===
 .venv/
 env/
 venv/
+ENV/
+
+# === AI 模型与缓存 ===
+*.bin
+*.gguf
+*.safetensors
+*.pt
+*.pth
+models/
+model_cache/
+huggingface_cache/
+
+# === Docker 相关 ===
+docker-compose.override.yml
+.dockerignore
+
+# === 日志与临时文件 ===
+logs/
+*.log
+*.log.*
+debug.log
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+
+# === IDE/编辑器/系统文件 ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claudederc
+claude.md
