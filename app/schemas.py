@@ -57,6 +57,15 @@ class ChatLogBase(BaseModel):
         ),
     )
 
+    # ---------------------------------------------------------
+    # 模型全局配置
+    # populate_by_name=True 是解决 validation_alias 双通的关键：
+    #   设了 validation_alias="ai_response" 后，Pydantic V2 默认只认别名 ai_response，
+    #   开启此选项后同时接受字段名 bot_reply，前端无需感知 ORM 列名。
+    #   本配置由 ChatLogCreate（入参）和 ChatLogResponse（出参）共同继承。
+    # ---------------------------------------------------------
+    model_config = ConfigDict(populate_by_name=True)
+
 
 class ChatLogCreate(ChatLogBase):
     """
@@ -93,11 +102,10 @@ class ChatLogResponse(ChatLogBase):
         description="会话日志自增主键 ID，数据库自动生成",
     )
 
-    tenant_id: str = Field(
+    tenant_id: int = Field(
         ...,
         description=(
-            "所属租户 ID，由后端从 X-Tenant-ID Header 提取后写入，前端只读。"
-            "ORM 列为 int 类型，Pydantic V2 自动强转为 str 以保证前端兼容性"
+            "所属租户 ID，由后端从 X-Tenant-ID Header 提取后写入，前端只读"
         ),
     )
 
@@ -122,8 +130,8 @@ class ChatLogResponse(ChatLogBase):
     )
 
     # 允许从 SQLAlchemy ORM 对象直接构造（obj.field → 自动读取对象属性）
-    # populate_by_name=True：防御性显式配置，确保在任何别名策略下字段名始终可接受
-    # （对 validation_alias 而言 Pydantic V2 已默认支持字段名，此处为意图显式声明）
+    # populate_by_name=True：与 ChatLogBase 保持一致，接受字段名 + 别名双通
+    # from_attributes=True：ChatLogResponse 专属，允许从 ORM 对象属性读取值
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
@@ -159,6 +167,15 @@ class TenantBase(BaseModel):
         ),
     )
 
+    # ---------------------------------------------------------
+    # 模型全局配置
+    # populate_by_name=True：配合 validation_alias="package_level" 实现双通 ——
+    #   前端传 plan_type（字段名）✅  从 ORM 读 package_level（别名）✅
+    #   本配置由 TenantCreate 和 TenantResponse 共同继承，
+    #   TenantResponse 会通过自己的 model_config 额外叠加 from_attributes=True
+    # ---------------------------------------------------------
+    model_config = ConfigDict(populate_by_name=True)
+
 
 class TenantCreate(TenantBase):
     """
@@ -191,13 +208,10 @@ class TenantResponse(TenantBase):
     - ORM 列 tenant_name / created_at → API 同名字段（无需 alias）
     """
 
-    tenant_id: str = Field(
+    tenant_id: int = Field(
         ...,
         validation_alias="id",
-        description=(
-            "租户唯一标识。ORM 列为 MySQL 自增 int 类型，"
-            "Pydantic V2 自动强转为 str 以保证前端 JavaScript 大数精度兼容"
-        ),
+        description="租户唯一标识（数据库自增主键，ORM 列为 int，与前端交互保持 int 避免隐式强转风险）",
     )
 
     metadata: dict = Field(
@@ -216,5 +230,6 @@ class TenantResponse(TenantBase):
     )
 
     # 允许从 SQLAlchemy ORM 对象直接构造
-    # populate_by_name=True：防御性显式配置（Pydantic V2 对 validation_alias 已默认接受字段名）
+    # populate_by_name=True：与 TenantBase 保持一致，接受字段名 + 别名双通
+    # from_attributes=True：TenantResponse 专属，允许从 ORM 对象属性读取值
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
