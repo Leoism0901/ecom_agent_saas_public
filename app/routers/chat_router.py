@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.schemas import ChatLogCreate, ChatLogResponse
-from app.services.chat_service import create_chat_log, get_chat_logs
+from app.services.chat_service import create_chat_log, get_chat_logs, process_chat_message
 
 # ---------------------------------------------------------
 # 路由实例
@@ -98,6 +98,58 @@ async def create_chat_log_endpoint(
     )
 
     # ORM 实例 → Pydantic Response 序列化（from_attributes=True 自动映射）
+    return ChatLogResponse.model_validate(chat_log_orm)
+
+
+# ============================================================
+# POST /api/v1/chats/process  —— 处理买家消息（含 FAQ 缓存拦截）
+# ============================================================
+
+@router.post("/process", response_model=ChatLogResponse, status_code=201)
+async def process_chat_message_endpoint(
+    log_data: ChatLogCreate,
+    x_tenant_id: str = Header(
+        ...,
+        description="租户唯一标识（必填），从 X-Tenant-ID Header 中提取，前端不可伪造",
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    处理买家消息并返回 AI 回复（FAQ 缓存优先，LLM 待接入）
+
+    完整处理链路：
+    1. 从 X-Tenant-ID Header 提取租户身份并转为 int
+    2. 调用 process_chat_message()，内部自动执行：
+       a. 【Redis FAQ 缓存拦截】匹配 faq:* 键，命中则直接返回预制回复
+       b. 【数据持久化】将买家消息与回复写入 sys_chat_log
+       c. 【LLM Agent 调用】缓存未命中时留空 ai_response，后续阶段接入
+    3. 将 ORM 实例序列化为 ChatLogResponse 返回给前端
+
+    与 POST /api/v1/chats/ 的区别：
+    - /chats/     → 直接创建日志，不查缓存（create_chat_log）
+    - /chats/process → 先查 FAQ 缓存再创建日志（process_chat_message）
+
+    通过 metadata_json.source 字段可判断回复来源：
+    - "faq_cache"   → 来自 Redis FAQ 缓存命中
+    - "llm_pending" → 缓存未命中，等待 LLM 异步生成
+
+    Args:
+        log_data:     Pydantic 校验后的请求体（user_message 必填）
+        x_tenant_id:  从 HTTP Header 强制提取的租户 ID
+        db:           get_db() 注入的异步数据库会话
+
+    Returns:
+        ChatLogResponse: ai_response 已填充（缓存命中）或为 null（待 LLM）
+    """
+    tenant_id_int = _parse_tenant_id(x_tenant_id)
+
+    # 调用核心业务函数 —— 内部自动完成 FAQ 缓存拦截 + 持久化
+    chat_log_orm = await process_chat_message(
+        db=db,
+        tenant_id=tenant_id_int,
+        user_message=log_data.user_message,
+    )
+
     return ChatLogResponse.model_validate(chat_log_orm)
 
 
