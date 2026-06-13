@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.schemas import ChatLogCreate, ChatLogResponse
 from app.services.chat_service import create_chat_log, get_chat_logs, process_chat_message
+from app.utils.rate_limiter import rate_limit_dependency
 
 # ---------------------------------------------------------
 # 路由实例
@@ -49,7 +50,11 @@ def _parse_tenant_id(raw: str) -> int:
         HTTPException(400): Header 值不是合法的整数
     """
     try:
-        return int(raw.strip())
+        # 当请求中包含多个同名 Header（如 x-tenant-id + X-Tenant-ID）时，
+        # FastAPI 会将它们以 ", " 分隔合并为一个字符串，如 "1, 1"。
+        # 此处取第一个有效值即可，后续的重复值忽略。
+        first_value = raw.strip().split(",")[0].strip()
+        return int(first_value)
     except (ValueError, AttributeError):
         raise HTTPException(
             status_code=400,
@@ -69,6 +74,7 @@ async def create_chat_log_endpoint(
         description="租户唯一标识（必填），从 X-Tenant-ID Header 中提取，前端不可伪造",
     ),
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_dependency),
 ):
     """
     创建一条新的买家-AI 会话日志
@@ -113,6 +119,7 @@ async def process_chat_message_endpoint(
         description="租户唯一标识（必填），从 X-Tenant-ID Header 中提取，前端不可伪造",
     ),
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_dependency),
 ):
     """
     处理买家消息并返回 AI 回复（FAQ 缓存优先，LLM 待接入）
