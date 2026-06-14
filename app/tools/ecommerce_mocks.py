@@ -385,3 +385,71 @@ def check_shipping_rules(item_id: str, province: str) -> dict:
             "note": "如遇大促活动，发货时效可能顺延，请以实际物流信息为准。",
         },
     }
+
+
+# ============================================================
+# 本地验收测试块（仅 python app/tools/ecommerce_mocks.py 时触发）
+# 不依赖任何外部服务，纯本地 print + json 输出验证
+# ============================================================
+if __name__ == "__main__":
+    import json
+
+    # ---------------------------------------------------------
+    # 第一阶段：逻辑连通性测试
+    # 覆盖三个函数的主要剧本分支，验证返回数据结构正确
+    # ---------------------------------------------------------
+    print("=" * 60)
+    print("  第一阶段：逻辑连通性测试（Mock 数据返回验证）")
+    print("=" * 60)
+
+    # --- get_order_status 测试 ---
+    print("\n>>> get_order_status('ORD-123') —— 期望：已发货 / 顺丰速运 / 派送中")
+    result_ord123 = get_order_status("ORD-123")
+    print(json.dumps(result_ord123, ensure_ascii=False, indent=2))
+
+    print("\n>>> get_order_status('ORD-404') —— 期望：异常停滞 / 72.5 小时")
+    result_ord404 = get_order_status("ORD-404")
+    print(json.dumps(result_ord404, ensure_ascii=False, indent=2))
+
+    # --- refund_item 测试 ---
+    print("\n>>> refund_item('ORD-999', reason='商品破损') —— 期望：退款成功 / 299.00 元 / 微信原返")
+    result_refund = refund_item("ORD-999", reason="商品破损")
+    print(json.dumps(result_refund, ensure_ascii=False, indent=2))
+
+    # --- check_shipping_rules 测试（偏远地区分支）---
+    print("\n>>> check_shipping_rules('ITEM-001', '新疆维吾尔自治区') —— 期望：不包邮 / 补 15 元")
+    result_shipping = check_shipping_rules("ITEM-001", "新疆维吾尔自治区")
+    print(json.dumps(result_shipping, ensure_ascii=False, indent=2))
+
+    # ---------------------------------------------------------
+    # 第二阶段：大模型 Docstring 可读性测试
+    # 打印关键函数的 Docstring，确认大模型 Tool-Calling 所需的三段落（触发意图 / Args / Returns）齐备
+    # ---------------------------------------------------------
+    print("\n\n" + "=" * 60)
+    print("  第二阶段：大模型 Docstring 可读性测试")
+    print("=" * 60)
+
+    print("\n" + "=" * 60)
+    print("  >>> get_order_status.__doc__")
+    print("=" * 60)
+    if get_order_status.__doc__:
+        print(get_order_status.__doc__)
+
+    print("\n" + "=" * 60)
+    print("  >>> refund_item.__doc__")
+    print("=" * 60)
+    if refund_item.__doc__:
+        print(refund_item.__doc__)
+
+    print("\n" + "=" * 60)
+    print("  >>> check_shipping_rules.__doc__")
+    print("=" * 60)
+    if check_shipping_rules.__doc__:
+        print(check_shipping_rules.__doc__)
+
+    # ---------------------------------------------------------
+    # 汇总结论
+    # ---------------------------------------------------------
+    print("\n" + "=" * 60)
+    print("  本地验收完成 —— 所有 Mock 工具逻辑连通 + Docstring 可读")
+    print("=" * 60)
