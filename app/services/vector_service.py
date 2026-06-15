@@ -22,12 +22,17 @@
   即使 Router 传入的 tenant_id 是伪造的，Qdrant 层面也会强制过滤
 """
 
+import hashlib
 import os
+import random
+import uuid
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 # ============================================================
 # 环境变量加载（确保模块被独立 import 时也能读到 .env 配置）
@@ -41,6 +46,17 @@ load_dotenv()
 _QDRANT_HOST: str = os.getenv("QDRANT_HOST", "localhost")
 _QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", "6333"))
 _QDRANT_API_KEY: str = os.getenv("QDRANT_API_KEY", "")
+
+# ============================================================
+# Embedding API 配置 —— 全部从 .env 环境变量读取（绝对禁止硬编码）
+# 当 EMBEDDING_API_KEY 为空时，自动降级为 Mock 模式（确定性哈希向量）
+# ============================================================
+_EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
+_EMBEDDING_API_URL: str = os.getenv(
+    "EMBEDDING_API_URL", "https://api.openai.com/v1/embeddings"
+)
+_EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+_EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "1024"))
 
 # ============================================================
 # Qdrant 客户端单例（模块级，惰性初始化）
@@ -71,6 +87,190 @@ def get_qdrant_client() -> QdrantClient:
 
     Returns:
         QdrantClient: 已配置并就绪的 Qdrant 客户端实例（同步客户端）
+    """
+    pass
+
+
+# ============================================================
+# Mock Embedding 辅助函数（零外部依赖，仅用于本地测试）
+# 当 EMBEDDING_API_KEY 未配置时自动启用
+# ============================================================
+
+def _generate_mock_embedding(text: str, dim: int) -> list[float]:
+    """
+    使用 MD5 哈希生成确定性模拟向量，用于本地无 API Key 测试。
+
+    算法原理：
+    1. 对输入文本取 UTF-8 编码的 MD5 哈希
+    2. 取哈希前 8 位十六进制转为整数，作为随机种子
+    3. 用该种子初始化 random.Random，生成 dim 维浮点数向量
+    4. 向量值均匀分布在 [-1.0, 1.0] 区间
+
+    确定性保证：
+    - 完全相同的文本 → 完全相同的向量（跨进程、跨机器可复现）
+    - 不同的文本 → 极大概率不同的向量
+
+    重要提示：
+    - 此函数仅用于本地开发与 CI 测试，Mock 向量不具备语义信息
+    - 生产环境必须配置 EMBEDDING_API_KEY 以获取真实语义向量
+
+    Args:
+        text: 待向量化的文本片段
+        dim:  目标向量维度
+
+    Returns:
+        长度为 dim 的浮点数列表，值域 [-1.0, 1.0]
+    """
+    pass
+
+
+# ============================================================
+# 文件读取辅助函数（多编码兼容）
+# ============================================================
+
+def _read_text_file(file_path: str) -> str:
+    """
+    读取本地文本文件，自动尝试多种编码格式，确保中文文本正确解析。
+
+    编码尝试顺序（按中文场景常见程度排列）：
+    1. UTF-8（现代标准，覆盖绝大多数场景）
+    2. GBK（Windows 中文系统默认 ANSI 编码）
+    3. GB2312（早期简体中文编码，GBK 子集）
+    4. Latin-1（兜底编码，永不抛解码异常，但中文会乱码）
+
+    容错策略：
+    - 前三种编码遇到非法字节序列时上抛异常，由下一顺位编码接管
+    - Latin-1 作为最终兜底：按字节 1:1 映射到 Unicode，保证不丢数据
+
+    Args:
+        file_path: 文本文件的绝对或相对路径
+
+    Returns:
+        解码后的文本内容（去除首尾空白）
+
+    Raises:
+        FileNotFoundError: 文件路径不存在时上抛
+        PermissionError:   文件不可读时上抛
+        RuntimeError:      所有编码均无法正确解码时上抛
+    """
+    pass
+
+
+# ============================================================
+# Embedding API 调用（真实 API + Mock 双模式，自动切换）
+# ============================================================
+
+async def _call_embedding_api(texts: list[str]) -> list[list[float]]:
+    """
+    调用云端 Embedding API 获取语义向量，无 API Key 时自动降级为 Mock 模式。
+
+    双模式自动切换逻辑：
+    ┌────────────────────────────────────────────────────────────┐
+    │ 判断条件：EMBEDDING_API_KEY 是否为空？                      │
+    │                                                            │
+    │  ├── 为空 → Mock 模式：使用 _generate_mock_embedding()     │
+    │  │         生成确定性哈希向量，维度 = _EMBEDDING_DIM         │
+    │  │         打印明确警告日志，提示当前为本地测试模式           │
+    │  │                                                        │
+    │  └── 有值 → 真实模式：通过 httpx 异步请求云端 API           │
+    │            - 请求格式：OpenAI 兼容（Authorization Bearer）   │
+    │            - URL、模型名从环境变量读取                       │
+    │            - 超时 60 秒，失败时上抛明确异常                  │
+    │            - 返回向量列表，按请求顺序对应                     │
+    └────────────────────────────────────────────────────────────┘
+
+    真实 API 请求格式（OpenAI 兼容接口）：
+    POST {EMBEDDING_API_URL}
+    Headers:
+      Authorization: Bearer {EMBEDDING_API_KEY}
+      Content-Type: application/json
+    Body:
+      {
+        "model": "{EMBEDDING_MODEL}",
+        "input": ["文本1", "文本2", ...],
+        "dimensions": {EMBEDDING_DIM}    // text-embedding-3-small 支持此参数
+      }
+
+    Args:
+        texts: 待向量化的文本列表（每个元素为一个分片）
+
+    Returns:
+        向量列表，每个元素为浮点数列表，维度 = _EMBEDDING_DIM
+
+    Raises:
+        RuntimeError: 真实 API 请求失败（网络错误、超时、鉴权失败等）
+    """
+    pass
+
+
+# ============================================================
+# 文档处理与向量入库主函数
+# ============================================================
+
+async def process_and_store_document(
+    file_path: str,
+    tenant_id: str,
+) -> int:
+    """
+    读取本地文档 → 文本切分 → 向量化 → 多租户隔离写入 Qdrant，完整 RAG 入库管线。
+
+    执行流程（四阶段流水线）：
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │ 阶段一：【文件读取 —— _read_text_file()】                     │
+    │   - 自动尝试 UTF-8 → GBK → GB2312 → Latin-1 多种编码          │
+    │   - 读取失败时上抛 FileNotFoundError / PermissionError         │
+    │   - 空文件（无有效内容）上抛 ValueError                         │
+    │                                                              │
+    │ 阶段二：【文本切分 —— RecursiveCharacterTextSplitter】        │
+    │   - chunk_size=400（每个分片最多 400 字符）                    │
+    │   - chunk_overlap=50（相邻分片重叠 50 字符，防止语义断裂）     │
+    │   - 分隔符优先级：双换行 → 单换行 → 中文句号 → 叹号 → 问号    │
+    │     → 分号 → 逗号 → 空格 → 逐字符                             │
+    │   - 切分后打印分片数量与平均长度，便于调试                      │
+    │                                                              │
+    │ 阶段三：【向量化 —— _call_embedding_api()】                   │
+    │   - 有 EMBEDDING_API_KEY → 真实云端 API（httpx 异步）          │
+    │   - 无 EMBEDDING_API_KEY → Mock 模式（确定性哈希向量）         │
+    │   - 返回维度 = _EMBEDDING_DIM 的浮点数向量列表                 │
+    │                                                              │
+    │ 阶段四：【多租户隔离写入 —— qdrant_client.upsert()】           │
+    │   - 每个分片生成唯一 UUID 作为 Point ID                        │
+    │   - Point Payload 强制注入以下字段：                            │
+    │       * "tenant_id": tenant_id（【红线】多租户隔离核心字段）    │
+    │       * "text": chunk_text（原始文本片段）                     │
+    │       * "chunk_index": 分片序号                                │
+    │       * "source_file": 来源文件路径                            │
+    │   - 批量 upsert 到 tenant_knowledge_base 集合                  │
+    │   - 写入失败时上抛异常，不会静默丢失数据                       │
+    └──────────────────────────────────────────────────────────────┘
+
+    多租户安全（架构红线，严禁违反）：
+    - tenant_id 由 Router 从 X-Tenant-ID Header 提取后传入
+    - 本函数负责将其强制写入每个 Point 的 Payload
+    - 后续检索时必须在 Qdrant Filter 中以 tenant_id 为必须条件过滤
+    - 前端无法通过伪造参数让数据落入其他租户的检索范围
+
+    异常处理策略：
+    - 文件读取失败 → 上抛 FileNotFoundError / PermissionError
+    - 空文件 → 上抛 ValueError
+    - 文本切分后无有效片段 → 上抛 ValueError
+    - Embedding API 失败 → 上抛 RuntimeError（含详细错误上下文）
+    - Qdrant 写入失败 → 上抛 RuntimeError（含失败原因）
+
+    Args:
+        file_path: 本地文本文件的绝对或相对路径（支持 .txt / .md / .csv 等纯文本格式）
+        tenant_id: 租户唯一标识，由 Router 从 X-Tenant-ID Header 提取后传入，
+                   本层负责强制写入 Qdrant Point Payload 实现多租户数据隔离
+
+    Returns:
+        成功写入 Qdrant 的 Point 总数（即文本分片数量）
+
+    Raises:
+        FileNotFoundError: 当 file_path 不存在时
+        PermissionError:   当文件不可读时
+        ValueError:        当文件内容为空或切分后无有效文本片段时
+        RuntimeError:      当 Embedding API 调用失败或 Qdrant 写入失败时
     """
     pass
 
