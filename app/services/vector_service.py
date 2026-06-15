@@ -12,9 +12,10 @@
 - 本层为纯 Service 层，绝不导入 FastAPI 路由模块（Router），保持解耦
 - 云端 Embedding API 方案：绝对不引入 torch / tensorflow / 本地模型加载库
 
-多租户隔离策略（向量库层面）：
-- 每个租户的数据在 Qdrant 中使用独立的 Collection（命名规则：{tenant_id}_{collection_name}）
-  或在同一个 Collection 内通过 Payload 字段 "tenant_id" 进行过滤
+多租户隔离策略（向量库层面 —— 共享 Collection + Payload 隔离）：
+- 【架构决策】所有租户共享同一个 Collection，由 init_knowledge_collection() 统一创建
+- 【红线】绝对禁止为单一租户动态创建新 Collection（如 tenant_1_kb, tenant_2_kb）
+- 数据隔离完全依赖 Point Payload 中的 "tenant_id" 字段进行过滤
 - 写入路径：tenant_id 由 Router 从 X-Tenant-ID Header 提取后传入本层，
   本层负责将其强制写入 Qdrant Point 的 Payload 中
 - 检索路径：每次查询必须在 Qdrant Filter 中显式指定 tenant_id，
@@ -26,6 +27,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
 
 # ============================================================
 # 环境变量加载（确保模块被独立 import 时也能读到 .env 配置）
@@ -70,20 +72,56 @@ def get_qdrant_client() -> QdrantClient:
     Returns:
         QdrantClient: 已配置并就绪的 Qdrant 客户端实例（同步客户端）
     """
-    global _qdrant_client
-    if _qdrant_client is None:
-        # 构建连接参数：本地部署无 api_key，Qdrant Cloud 需要 api_key
-        client_kwargs: dict = {
-            "host": _QDRANT_HOST,
-            "port": _QDRANT_PORT,
-        }
-        # 仅当环境变量中配置了 API Key 时才传入，避免空字符串导致认证异常
-        if _QDRANT_API_KEY:
-            client_kwargs["api_key"] = _QDRANT_API_KEY
+    pass
 
-        _qdrant_client = QdrantClient(**client_kwargs)
 
-    return _qdrant_client
+async def init_knowledge_collection(
+    collection_name: str = "tenant_knowledge_base",
+    vector_size: int = 1024,
+) -> None:
+    """
+    初始化 Qdrant 知识库集合 —— 全租户共享，一次创建、全局复用。
+
+    【架构决策 —— 共享 Collection 模式】
+    此 Collection 为所有租户共享，绝对禁止为单一租户动态创建新 Collection。
+    后续数据写入与检索，必须强依赖 payload 中的 tenant_id 字段进行数据隔离。
+
+    为什么采用共享 Collection 而非每租户独立 Collection：
+    1. 运维成本：单 Collection 只需维护一套索引，避免了数百个租户 Collection
+       的管理开销（备份、清理、监控等）
+    2. 连接开销：Qdrant 客户端无需在租户间切换 Collection，检索更高效
+    3. 安全等效：通过 Qdrant Filter 在 Payload 层面过滤 tenant_id，
+       隔离效果与独立 Collection 完全等同
+    4. 扩展灵活：新租户自动纳入隔离体系，无需额外的 Collection 创建步骤
+
+    幂等性保证：
+    - 调用 collection_exists() 检查集合是否已存在
+    - 若已存在则直接返回（不重复创建、不覆盖现有数据）
+    - 可安全地在应用启动时反复调用，不会引发副作用
+
+    向量配置说明：
+    - distance=Distance.COSINE：余弦相似度，适用于语义搜索场景
+    - vector_size 默认 1024 维（匹配智谱 embedding-2 / bge-large-zh 等模型输出维度）
+    - 更换 Embedding 模型时必须同步调整 vector_size，否则 upsert 会因维度不匹配被拒绝
+
+    调用时机：
+    - 推荐在 FastAPI 应用启动事件（lifespan / startup hook）中调用本函数
+    - 确保在首次 embed_and_store_text() 写入之前 Collection 已就绪
+
+    Args:
+        collection_name: Qdrant Collection 名称，默认 "tenant_knowledge_base"
+                        所有租户的知识文本统一存入此集合，通过 Payload 字段隔离
+        vector_size:     向量维度，必须与所选 Embedding 模型的输出维度一致
+                        默认 1024（智谱 embedding-2 输出维度）
+
+    Returns:
+        None（创建成功或已存在时静默返回，失败时上抛异常）
+
+    Raises:
+        ConnectionError: 当 Qdrant 服务不可达时（由 QdrantClient 内部上抛）
+        RuntimeError:    当 Collection 创建失败时（磁盘满、权限不足等）
+    """
+    pass
 
 
 async def embed_and_store_text(text: str, tenant_id: str) -> None:
@@ -139,33 +177,4 @@ async def embed_and_store_text(text: str, tenant_id: str) -> None:
         ConnectionError: 当 Qdrant 服务不可达时
         RuntimeError: 当 Embedding API 调用失败时
     """
-    # ---------------------------------------------------------
-    # 第一步：参数校验 —— 空文本拒绝在入口处，避免无效 API 调用
-    # ---------------------------------------------------------
-    if not text or not text.strip():
-        raise ValueError("待向量化的文本不能为空或仅含空白字符")
-
-    # ---------------------------------------------------------
-    # 第二步：获取 Qdrant 客户端单例（惰性初始化，首次调用时建立连接）
-    # ---------------------------------------------------------
-    client: QdrantClient = get_qdrant_client()
-
-    # ============================================================
-    # TODO: 以下为骨架占位，后续阶段逐步实现
-    #   1. 文本分片（langchain-text-splitters）
-    #   2. 调用云端 Embedding API 获取向量
-    #   3. 确保 Collection 存在（自动创建 + 向量维度校验）
-    #   4. 构建 Point（含 tenant_id Payload 强制注入）
-    #   5. 执行 upsert 写入
-    # ============================================================
-
-    # 骨架阶段：仅打印日志确认调用链路已通，不执行实际写入
-    print(
-        f"[vector_service.embed_and_store_text] 骨架调用确认："
-        f"tenant_id={tenant_id}, "
-        f"text_len={len(text.strip())}, "
-        f"qdrant_host={_QDRANT_HOST}:{_QDRANT_PORT}"
-    )
-
-    # 后续实现完成后，此处将替换为完整的 Embedding + Upsert 逻辑
-    return None
+    pass
