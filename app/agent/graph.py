@@ -78,28 +78,42 @@ async def run_agent(
     tenant_id: str,
     tenant_prompt: str,
     user_message: str,
+    chat_history: Optional[list[dict]] = None,
 ) -> dict:
     """
-    执行 Agent 工作流 —— Router 层的统一调用入口。
+    执行 Agent 工作流 —— Router 层与 Service 层的统一调用入口。
 
-    本函数屏蔽了 StateGraph 的内部拓扑细节，Router 层只需：
+    本函数屏蔽了 StateGraph 的内部拓扑细节，调用方只需：
     1. 从 X-Tenant-ID Header 提取 tenant_id。
     2. 通过 ChatService.get_tenant_prompt() 获取 tenant_prompt。
     3. 将买家消息作为 user_message 传入本函数。
+    4. （可选）将 Redis 短期记忆读取的历史对话作为 chat_history 传入。
 
     内部流程：
-    1. 将 (tenant_id, tenant_prompt, user_message) 组装为符合 AgentState 的初始状态字典。
-    2. 调用 app.ainvoke(initial_state) 启动图执行，LLM 节点自动完成 Prompt 注入与回复生成。
-    3. 返回最终状态字典，供 Router 层提取 AI 回复。
+    1. 若提供了 chat_history，将其中每条 dict 消息转换为 LangChain 消息对象，
+       （HumanMessage / AIMessage）注入到 messages 列表头部，实现多轮对话上下文预热。
+    2. 将当前 user_message 构造为 HumanMessage 追加到 messages 列表末尾。
+    3. 组装完整的 AgentState 初始字典，调用 app.ainvoke(initial_state) 启动图执行。
+    4. LLM 节点从 messages 中读取完整对话历史 + 最新问题，自动完成 Prompt 注入与回复生成。
+    5. 返回最终状态字典，供调用方提取 AI 回复。
+
+    多轮对话支持（chat_history 参数）：
+    - chat_history 来源于 app.utils.redis_memory.get_memory_messages() 的返回值。
+    - 格式为 [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}, ...]。
+    - 传入后会被转换为 LangChain 消息对象，使大模型能看到之前几轮对话的完整上下文。
+    - 不传 chat_history 时退化为单轮对话模式（向后兼容）。
 
     Args:
         tenant_id:      租户唯一标识（来自 X-Tenant-ID 请求头）。
         tenant_prompt:  该租户专属的系统提示词（由 ChatService.get_tenant_prompt() 返回）。
         user_message:   买家原始消息文本。
+        chat_history:   可选 —— Redis 短期记忆中读取的历史对话列表。
+                        每条消息为 {"role":"user"|"assistant", "content":"消息文本", ...}。
+                        传入后注入到初始 State 的 messages 中，实现多轮上下文。
 
     Returns:
         dict: LangGraph 工作流执行完毕后的最终状态字典，
-              其中 messages 字段包含了 AI 回复及工具调用中间消息。
+              其中 messages 字段包含了历史消息、AI 回复及工具调用中间消息。
     """
     pass
 
