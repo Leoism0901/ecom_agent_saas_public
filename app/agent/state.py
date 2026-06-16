@@ -47,6 +47,30 @@ class AgentState(TypedDict):
     当前租户专属的系统提示词
 
     包含租户级别的定制人设、业务规则、品牌语调等约束信息，
-    由 PromptManager 按需注入到 LLM 调用节点中，动态约束大模型的输出风格与业务边界，
-    实现「千人千面」的 Agent 回复能力。
+    由 ChatService.get_tenant_prompt() 三层级联加载（Redis → MySQL → 兜底），
+    在 LLM 调用节点中作为 role="system" 强制注入请求体首位，
+    动态约束大模型的输出风格与业务边界，实现「千人千面」的 Agent 回复能力。
+    """
+
+    chat_history: list[dict]
+    """
+    从 Redis List 中读取的短期对话记忆（近 5 轮历史，最多 10 条消息）
+
+    数据来源：app.utils.redis_memory.get_memory_messages() 的返回值，
+    在 Agent 工作流启动前（Router 层或 graph.run_agent 入口处）注入初始状态。
+
+    每条消息格式为：
+        {
+            "role": "user" | "assistant" | "tool",
+            "content": "消息文本...",
+            "timestamp": "2026-06-16T10:30:00+00:00",
+            "metadata": {...}   # 可选，仅写入时传了 metadata 才存在
+        }
+
+    与 messages 字段的区别：
+    - messages：LangChain 消息对象列表（HumanMessage / AIMessage / ToolMessage），
+      供 LangGraph 内部节点流转和 LLM 调用使用。
+    - chat_history：纯 Python dict 列表，来自 Redis 短期记忆存储，
+      用于在 LLM 节点的 Prompt 中注入历史上下文摘要，或在多轮对话开始时
+      预热 messages 列表（将 dict 转换为 LangChain 消息对象后追加到 messages）。
     """
