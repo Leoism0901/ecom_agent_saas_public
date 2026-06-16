@@ -74,3 +74,13 @@ class AgentState(TypedDict):
       用于在 LLM 节点的 Prompt 中注入历史上下文摘要，或在多轮对话开始时
       预热 messages 列表（将 dict 转换为 LangChain 消息对象后追加到 messages）。
     """
+
+
+    question: str
+    """
+    当前轮次的买家原始问题文本
+
+    由 run_agent() 在组装初始 State 时注入，对应 ChatService.process_chat()
+    接收的 question 参数。LLM 节点在构建请求体 messages 数组时，
+    将本条消息作为最后一条 role="user" 消息追加到列表末尾。
+    """
