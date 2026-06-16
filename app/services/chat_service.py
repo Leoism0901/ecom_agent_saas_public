@@ -1,5 +1,5 @@
 """
-会话日志（ChatLog）业务服务层【纯骨架版本】
+会话日志（ChatLog）业务服务层
 
 本模块是电商 SaaS 平台的多租户会话日志核心，负责：
 1. 会话日志的创建与历史查询，所有写入路径强制绑定 tenant_id
@@ -21,6 +21,7 @@
 - Redis FAQ 缓存命中时，必须立即返回预制回复，彻底跳过后续 LLM 调用链路
 - 所有 Redis 连接配置必须从 .env 环境变量读取，严禁硬编码敏感信息
 """
+
 import logging
 import os
 import uuid
@@ -127,6 +128,12 @@ async def create_chat_log(
     pass
 
 
+# ============================================================
+# 买家消息处理主入口 —— process_chat_message
+# 完整业务链路：FAQ 缓存拦截 → 持久化 →（待接入）LLM 生成
+# ============================================================
+
+
 async def process_chat_message(
     db: AsyncSession,
     tenant_id: int,
@@ -221,6 +228,8 @@ async def get_chat_log_by_id(
 # 将提示词管理、会话处理等高频复用逻辑收敛至类实例，
 # 与上方独立函数（chat log CRUD）共存，互不干扰。
 # ============================================================
+
+
 class ChatService:
     """
     多租户聊天服务 —— 提示词管理与会话编排入口
@@ -234,6 +243,7 @@ class ChatService:
     - 提示词加载链路：Redis（热缓存）→ MySQL（温数据）→ 硬编码兜底（冷启动）
     - 日志全程中文输出，便于运维排查与调试
     """
+
     # ---------------------------------------------------------
     # 类级常量：Redis 键前缀与缓存 TTL
     # ---------------------------------------------------------
@@ -306,3 +316,123 @@ class ChatService:
             str: 该租户专属的系统提示词（保证非空字符串）
         """
         pass
+
+
+# ============================================================
+# LangGraph 对话节点 —— LLM 生成与工具编排核心
+#
+# 本段代码是 Agent 工作流中"真正调用大模型"的节点实现，
+# 负责 Prompt 注入 → LLM 调用 → 工具执行 → 结果回传的完整闭环。
+#
+# 架构红线（遵循 CLAUDE.md）：
+# - 所有 LangGraph 节点逻辑、Prompt 组装、工具执行编排均驻留在本 Service 层。
+# - Router 层绝不感知节点内部实现细节，只通过 graph.run_agent() 入口调用。
+# - 节点函数签名严格适配 LangGraph StateGraph.add_node() 规范：
+#   async def node_func(state: AgentState) -> dict
+# ============================================================
+
+import importlib
+import json as json_module
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from app.agent.state import AgentState
+from app.services.llm_service import LLMResponse, ToolCallRequest, async_call_llm
+
+
+def _langchain_messages_to_api_dicts(lc_messages: list) -> list[dict]:
+    """
+    将 LangChain 消息对象列表转换为大模型 API 所需的纯 dict 格式。
+
+    转换规则（按消息类型分支）：
+    ┌──────────────────────────────────────────────────────────────┐
+    │ HumanMessage  → {"role": "user",       "content": str}       │
+    │ AIMessage     → {"role": "assistant",  "content": str|null,  │
+    │                                   "tool_calls": [...]|None}  │
+    │ ToolMessage   → {"role": "tool",       "content": str,       │
+    │                              "tool_call_id": str}            │
+    │ SystemMessage → 跳过（由 async_call_llm 统一注入              │
+    │                 state["tenant_prompt"] 作为 role="system"）   │
+    └──────────────────────────────────────────────────────────────┘
+
+    设计意图：
+    - LangGraph 内部使用 LangChain 消息对象维护对话上下文。
+    - 大模型 API 只接受纯 JSON dict 格式。
+    - 本函数是两条消息体系之间的唯一转换桥梁，避免转换逻辑散落各处。
+
+    Args:
+        lc_messages: LangGraph state["messages"] 中的 LangChain 消息列表。
+
+    Returns:
+        list[dict]: API 兼容的消息列表，每项为 {"role": "user/assistant/tool",
+                                                 "content": ...} 格式。
+    """
+    pass
+
+
+async def _execute_tool_dynamic(tool_name: str, arguments: dict) -> dict:
+    """
+    根据工具名动态分发执行对应的本地 Mock 工具函数。
+
+    分发策略（零硬编码，完全由 TOOL_REGISTRY 驱动）：
+    1. 通过 importlib 动态加载 app.tools.ecommerce_mocks 模块。
+    2. 使用 getattr 按工具名获取函数对象。
+    3. 以 **arguments 解包方式调用函数（arguments 已由 ToolCallRequest 校验）。
+    4. 函数执行异常时返回带 error 标记的字典，不向上抛异常。
+
+    设计意图：
+    - 工具的执行逻辑对 LangGraph 节点透明 —— 节点只需知道工具名和参数，
+      不需要知道具体是哪个 Python 函数。
+    - 新增工具只需在 ecommerce_mocks.TOOL_REGISTRY 中注册，无需修改本函数。
+
+    Args:
+        tool_name: 工具函数名（如 "get_order_status"），与 TOOL_REGISTRY 键一致。
+        arguments: 工具调用的参数字典（如 {"order_id": "ORD-123"}）。
+
+    Returns:
+        dict: 工具函数的原始返回字典，或 {"error": str} 表示执行失败。
+    """
+    pass
+
+
+async def llm_generate_node(state: AgentState) -> dict:
+    """
+    LLM 生成节点 —— 多租户提示词注入 + 大模型调用 + 工具执行编排的核心节点。
+
+    本节点是 LangGraph 工作流中"真正调用大模型"的唯一节点，负责：
+    ┌──────────────────────────────────────────────────────────────┐
+    │ 步骤 1：从 state 中提取 tenant_prompt、messages、tenant_id  │
+    │ 步骤 2：将 LangChain 消息对象转换为 API dict 格式            │
+    │ 步骤 3：调用 async_call_llm，tenant_prompt 作为 system 消息   │
+    │         由 llm_service 强注入请求体首位                       │
+    │ 步骤 4：若大模型返回 tool_calls → 动态执行本地 Mock 工具      │
+    │         → 将工具结果回传大模型 → 获取最终自然语言回复         │
+    │ 步骤 5：将所有新消息（工具调用 + 工具结果 + 最终回复）        │
+    │         打包为 LangChain 消息对象，追加到 state["messages"]    │
+    └──────────────────────────────────────────────────────────────┘
+
+    Prompt 注入策略（多租户隔离红线）：
+    - state["tenant_prompt"] 由上游 Router → ChatService.get_tenant_prompt()
+      三层级联加载（Redis → MySQL → 兜底），保证每次调用都有可用提示词。
+    - async_call_llm 内部将 tenant_prompt 作为 role="system" 强制插入
+      messages 列表索引 0 位置，大模型无法绕过系统约束。
+    - 历史消息中的旧 SystemMessage 会被 _langchain_messages_to_api_dicts
+      显式跳过，确保每次调用只使用最新的租户提示词。
+
+    工具执行循环（防无限调用）：
+    - 最大工具调用轮数由环境变量 AGENT_MAX_TOOL_ROUNDS 控制（默认 10）。
+    - 每轮工具调用消耗 1 个计数，超出后强制降级为"请稍后重试"文本回复。
+    - 工具执行异常不中断流程，error 字典作为 ToolMessage 回传大模型。
+
+    Args:
+        state: LangGraph 全局共享状态（AgentState TypedDict），包含：
+               - messages:      会话历史（LangChain 消息对象列表）
+               - tenant_id:     当前租户唯一标识
+               - tenant_prompt: 该租户专属的系统提示词
+
+    Returns:
+        dict: 符合 LangGraph StateGraph 节点规范的返回字典，
+              格式为 {"messages": [AIMessage, ToolMessage, ...]}，
+              由 LangGraph 的 add_messages reducer 自动追加到 state["messages"]。
+    """
+    pass
