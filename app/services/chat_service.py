@@ -191,7 +191,7 @@ async def get_chat_logs(
     Args:
         db:        由 get_db() 注入的异步数据库会话
         tenant_id: 租户唯一标识，由 Router 从 X-Tenant-ID Header 提取后传入
-        limit:     返回的最大记录数（默认 50，防止一次返回过多数据）
+        limit:     返回的最大记录数（默认 50，防止一次返回过多数据拖垮接口）
 
     Returns:
         ChatLog ORM 实例序列（仅包含当前租户的数据，可能为空序列）
@@ -317,6 +317,81 @@ class ChatService:
         """
         pass
 
+    # ================================================================
+    # process_chat —— 多轮对话处理核心入口（Redis 短期记忆 + LangGraph）
+    # 串联「历史读取 → 提示词加载 → Agent 执行 → 记忆回写」完整链路
+    # ================================================================
+
+    async def process_chat(
+        self,
+        tenant_id: str,
+        session_id: str,
+        question: str,
+        db: AsyncSession,
+    ) -> str:
+        """
+        处理买家多轮对话的核心异步 Service 方法 —— 串联完整 Agent 执行链路。
+
+        本方法是 ChatService 的最高层编排入口，内部严格按以下顺序执行：
+        ┌──────────────────────────────────────────────────────────────┐
+        │ 步骤 1：异步调用 get_messages 获取当前 session 的历史对话    │
+        │         从 Redis List 中读取近 5 轮（最多 10 条）短期记忆，  │
+        │         作为多轮对话上下文注入到 LangGraph 的初始 State。     │
+        │                                                              │
+        │ 步骤 2：获取（或模拟获取）当前租户的 tenant_prompt            │
+        │         通过 self.get_tenant_prompt() 三层级联加载            │
+        │         （Redis 热缓存 → MySQL 温数据 → 硬编码兜底），        │
+        │         确保每次 Agent 执行都有专属人设约束。                 │
+        │                                                              │
+        │ 步骤 3：组装 LangGraph 需要的初始 State 字典                  │
+        │         必须包含 chat_history（历史 dict 列表）、             │
+        │         tenant_prompt（系统提示词）和 question（当前问题）。  │
+        │         run_agent() 内部会将 chat_history dict 转换为         │
+        │         LangChain 消息对象并注入到 messages 中。              │
+        │                                                              │
+        │ 步骤 4：await 调用 LangGraph 的执行逻辑                       │
+        │         通过 run_agent() 启动图引擎，按拓扑连线依次执行：    │
+        │         START → llm_generate_node → END。                    │
+        │         LLM 节点自动完成 Prompt 注入 + 工具调用 + 回复生成。 │
+        │                                                              │
+        │ 步骤 5：获取图执行完毕后的最终回复                            │
+        │         从 final_state["messages"] 中反向遍历，              │
+        │         提取最后一条有 content 的 AIMessage 作为最终回复。    │
+        │                                                              │
+        │ 步骤 6：异步调用两次 add_message，分别将用户的 question      │
+        │         (role="user") 和最终回复 (role="assistant") 写入     │
+        │         Redis，供下一轮对话作为历史上下文读取。               │
+        │                                                              │
+        │ 步骤 7：返回最终回复文本给 Router 层                         │
+        └──────────────────────────────────────────────────────────────┘
+
+        降级策略（每个环节独立降级，不阻断主流程）：
+        - Redis 读取失败 → chat_history=[]，Agent 以"冷启动"单轮模式运行，
+          不影响回复生成质量（只是缺少多轮上下文）。
+        - 提示词加载失败 → 使用硬编码通用电商客服兜底提示词，
+          保证 Agent 在任何情况下都有合规的人设约束。
+        - LangGraph 执行失败 → 上抛异常，由 Router 层的 HTTPException 统一处理。
+        - Redis 写入失败 → 静默记录 Warning 日志，不影响 AI 回复的正常返回，
+          短期记忆是增强体验的辅助手段，不是关键路径。
+
+        Args:
+            tenant_id:  租户唯一标识（字符串形式，如 "1"、"42"），
+                       用于 Redis Key 隔离 + 提示词查询。
+            session_id: 会话 UUID，用于 Redis 短期记忆的 Key 组装，
+                       同一租户的不同 session 拥有独立的短期记忆空间。
+            question:   买家原始问题文本（本轮的 HumanMessage 内容）。
+            db:         FastAPI get_db() 依赖注入的异步数据库会话，
+                       供 get_tenant_prompt() 查询 MySQL 租户配置。
+
+        Returns:
+            str: AI 最终回复文本（已从 final_state 的 AIMessage 中提取的纯文本）。
+
+        Raises:
+            不主动捕获异常 —— LangGraph 执行失败时异常会自然上抛至 Router 层，
+            由 FastAPI 的全局异常处理器统一转换为 HTTP 500 响应。
+        """
+        pass
+
 
 # ============================================================
 # LangGraph 对话节点 —— LLM 生成与工具编排核心
@@ -338,6 +413,10 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app.agent.state import AgentState
 from app.services.llm_service import LLMResponse, ToolCallRequest, async_call_llm
+from app.utils.redis_memory import (
+    add_message_to_memory as add_message,
+    get_memory_messages as get_messages,
+)
 
 
 def _langchain_messages_to_api_dicts(lc_messages: list) -> list[dict]:
@@ -397,14 +476,18 @@ async def _execute_tool_dynamic(tool_name: str, arguments: dict) -> dict:
 
 async def llm_generate_node(state: AgentState) -> dict:
     """
-    LLM 生成节点 —— 多租户提示词注入 + 大模型调用 + 工具执行编排的核心节点。
+    LLM 生成节点 —— 动态 Prompt 组装 + 大模型调用 + 工具执行编排的核心节点。
 
     本节点是 LangGraph 工作流中"真正调用大模型"的唯一节点，负责：
     ┌──────────────────────────────────────────────────────────────┐
-    │ 步骤 1：从 state 中提取 tenant_prompt、messages、tenant_id  │
-    │ 步骤 2：将 LangChain 消息对象转换为 API dict 格式            │
-    │ 步骤 3：调用 async_call_llm，tenant_prompt 作为 system 消息   │
-    │         由 llm_service 强注入请求体首位                       │
+    │ 步骤 1：从 state 中提取 tenant_prompt、chat_history、        │
+    │         question、tenant_id 四个核心字段                      │
+    │ 步骤 2：动态组装 messages 数组（三层拼接，绝不硬编码）：     │
+    │         2.1 system  → state["tenant_prompt"]                  │
+    │         2.2 history → state["chat_history"]（已清洗）         │
+    │         2.3 user    → state["question"]                       │
+    │ 步骤 3：调用 async_call_llm，将组装好的 messages 传入        │
+    │         （system 消息已在 messages[0]，不再单独传参）         │
     │ 步骤 4：若大模型返回 tool_calls → 动态执行本地 Mock 工具      │
     │         → 将工具结果回传大模型 → 获取最终自然语言回复         │
     │ 步骤 5：将所有新消息（工具调用 + 工具结果 + 最终回复）        │
@@ -414,10 +497,10 @@ async def llm_generate_node(state: AgentState) -> dict:
     Prompt 注入策略（多租户隔离红线）：
     - state["tenant_prompt"] 由上游 Router → ChatService.get_tenant_prompt()
       三层级联加载（Redis → MySQL → 兜底），保证每次调用都有可用提示词。
-    - async_call_llm 内部将 tenant_prompt 作为 role="system" 强制插入
-      messages 列表索引 0 位置，大模型无法绕过系统约束。
-    - 历史消息中的旧 SystemMessage 会被 _langchain_messages_to_api_dicts
-      显式跳过，确保每次调用只使用最新的租户提示词。
+    - 将 tenant_prompt 作为 messages[0]（role="system"）显式注入，
+      大模型无法绕过系统约束。
+    - chat_history 中的额外字段（timestamp / metadata）在组装时被剔除，
+      仅保留 role 和 content，避免 LLM API 校验失败。
 
     工具执行循环（防无限调用）：
     - 最大工具调用轮数由环境变量 AGENT_MAX_TOOL_ROUNDS 控制（默认 10）。
@@ -426,9 +509,10 @@ async def llm_generate_node(state: AgentState) -> dict:
 
     Args:
         state: LangGraph 全局共享状态（AgentState TypedDict），包含：
-               - messages:      会话历史（LangChain 消息对象列表）
-               - tenant_id:     当前租户唯一标识
                - tenant_prompt: 该租户专属的系统提示词
+               - chat_history:  Redis 短期记忆中的历史对话（dict 列表）
+               - question:      当前轮次的买家原始问题文本
+               - tenant_id:     当前租户唯一标识
 
     Returns:
         dict: 符合 LangGraph StateGraph 节点规范的返回字典，
