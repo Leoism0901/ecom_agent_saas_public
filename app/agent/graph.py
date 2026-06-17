@@ -7,16 +7,16 @@ LangGraph 工作流编排图 —— 初始化与编译模块
 3. 编译为可执行的 LangGraph 应用实例（app）。
 4. 提供对外的异步执行封装函数 run_agent()，供 Router 层直接调用。
 
-当前阶段：【长记忆压缩第一阶段 —— 状态扩展 + 触发条件】
+当前阶段：【长记忆压缩第二阶段 —— 真实压缩节点落地】
 - llm_generate_node 已接入真实大模型（豆包 1.6），支持 Tool-Calling 动态工具调用。
 - 多租户提示词（tenant_prompt）在节点内部作为 system 消息强制注入。
-- 新增条件路由 should_compress_memory：消息数 ≥ 11 时触发压缩分支。
-- dummy_compress_node 为占位节点，后续阶段将替换为真正的长记忆压缩逻辑。
+- 条件路由 should_compress_memory：消息数 ≥ 11 时触发压缩分支。
+- summarize_memory 为真实压缩节点：调用大模型提炼对话标签 → 合并 summary → 截断 messages。
 
 拓扑连线（当前）：
     START → llm_generate_node → should_compress_memory (条件边)
                                       ├── "continue" → END
-                                      └── "compress" → dummy_compress_node → END
+                                      └── "compress" → summarize_memory → END
 
 架构红线（遵循 CLAUDE.md）：
 - 本模块仅负责图结构编排，所有 LLM 调用与 Prompt 逻辑下沉至 Service 层。
@@ -31,6 +31,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.agent.nodes import (
     llm_generate_node,
+    summarize_memory,
 )
 from app.agent.state import AgentState
 
@@ -72,29 +73,6 @@ def should_compress_memory(state: AgentState) -> str:
     pass
 
 
-async def dummy_compress_node(state: AgentState) -> dict:
-    """
-    长记忆压缩占位节点 —— 后续阶段将替换为真正的压缩逻辑。
-
-    当前阶段仅为满足条件边（conditional edge）的拓扑完整性而存在，
-    不执行任何实际的压缩操作。仅打印一条醒目的占位日志表明已进入
-    压缩分支，然后原样返回空字典（不对 state 做任何修改）。
-
-    后续阶段（compress_node 真正实现时）将在此处：
-    1. 从 state["messages"] 中提取历史消息。
-    2. 调用大模型将历史消息压缩为一段精炼摘要。
-    3. 将摘要写入 state["summary"] 字段。
-    4. 截断 state["messages"]，仅保留最近 N 条消息。
-
-    Args:
-        state: LangGraph 全局共享状态（AgentState TypedDict）。
-
-    Returns:
-        dict: 空字典，表示不对 state 做任何字段修改。
-    """
-    pass
-
-
 # ============================================================
 # 1. 实例化 StateGraph —— 绑定 AgentState 作为全局状态容器
 # ============================================================
@@ -106,7 +84,7 @@ workflow = StateGraph(AgentState)
 #    也在此处注册，并配合条件边实现复杂拓扑
 # ============================================================
 workflow.add_node("llm_generate_node", llm_generate_node)
-workflow.add_node("dummy_compress_node", dummy_compress_node)
+workflow.add_node("summarize_memory", summarize_memory)
 
 # ============================================================
 # 3. 编排拓扑连线（条件分支拓扑）
@@ -114,17 +92,17 @@ workflow.add_node("dummy_compress_node", dummy_compress_node)
 #    当前连线：
 #    START → llm_generate_node → should_compress_memory (条件边)
 #                                      ├── "continue" → END
-#                                      └── "compress" → dummy_compress_node → END
+#                                      └── "compress" → summarize_memory → END
 #
 #    llm_generate_node 内部已实现完整闭环：
 #    Prompt 注入 → LLM 调用 → 工具执行（可选）→ 最终文本回复
 #
 #    should_compress_memory 在 LLM 节点执行完毕后检查消息数量：
 #    - 消息数 < 11  → 路由到 END，正常结束
-#    - 消息数 ≥ 11  → 路由到 dummy_compress_node（占位），再进入 END
+#    - 消息数 ≥ 11  → 路由到 summarize_memory，执行长记忆压缩
 #
-#    dummy_compress_node 当前为占位实现，仅打印日志并透传 state，
-#    后续阶段将替换为真正的长记忆压缩逻辑。
+#    summarize_memory 执行真实的长记忆压缩逻辑：
+#    消息转换 → 大模型标签提炼 → summary 合并 → messages 截断 → END
 #
 #    后续阶段将改造为多节点条件拓扑：
 #    START → intent_classifier ─┬─ logistics ─→ check_logistics ─→ END
@@ -138,13 +116,13 @@ workflow.add_conditional_edges(
     "llm_generate_node",
     should_compress_memory,
     {
-        "continue": END,                   # 消息数不足 11 条，正常结束
-        "compress": "dummy_compress_node",  # 消息数 ≥ 11 条，进入压缩节点
+        "continue": END,               # 消息数不足 11 条，正常结束
+        "compress": "summarize_memory",  # 消息数 ≥ 11 条，进入长记忆压缩节点
     },
 )
 
 # ---- 压缩节点执行完毕后进入结束 ----
-workflow.add_edge("dummy_compress_node", END)
+workflow.add_edge("summarize_memory", END)
 
 # ============================================================
 # 4. 编译图 —— 生成可供外部调用的 LangGraph 应用实例
