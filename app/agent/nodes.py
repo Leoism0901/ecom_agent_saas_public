@@ -109,13 +109,13 @@ async def summarize_memory(state: AgentState) -> dict:
             （买家的原始提问），确保后续 LLM 调用的上下文窗口
             不会被无限膨胀的消息历史撑爆。
 
-    步骤 5：将提炼出的结构化摘要持久化写入 MySQL ChatLog.metadata_json
-            独立创建 DB 会话完成存储，存储失败仅告警不阻断主流程。
+    步骤 5：独立创建 DB 会话，将结构化摘要持久化写入 ChatLog.metadata_json，
+            数据库异常静默降级，不阻断主回复流程。
 
     降级策略（三层兜底，逐层加固）：
     - 第一层：extract_conversation_tags 内部已兜底，返回合法三字段 JSON
     - 第二层：步骤 3 每个字段独立 try-except，解析失败用空值填充
-    - 第三层：整体 try-except，数据库持久化异常静默降级，确保任何情况下返回合法 JSON 不崩溃
+    - 第三层：整体异常、数据库持久化异常均静默捕获，确保任何情况下返回合法结构不崩溃
 
     Args:
         state: LangGraph 全局共享状态（AgentState TypedDict），
@@ -127,5 +127,35 @@ async def summarize_memory(state: AgentState) -> dict:
               messages 字段由 add_messages reducer 处理 ——
               RemoveMessage 条目会从列表中移除对应消息，
               最后一条 HumanMessage 会被重新追加。
+    """
+    pass
+
+
+# ============================================================
+# 人工接管兜底节点 —— Day 12 新增
+# ============================================================
+
+
+async def human_fallback_node(state: AgentState) -> dict:
+    """
+    人工接管兜底节点 —— 极端意图短路拦截的终点节点。
+
+    触发场景：
+    当 should_escalate_to_human 条件路由在买家消息中检测到
+    「诈骗」「投诉」「12315」「律师函」「工商」「维权」「消协」「法院」
+    等敏感关键词时，图流转直接跳转至本节点，绕过 LLM 调用链路。
+
+    当前阶段（占位实现）：
+    - 打印一条醒目的检测日志，标记触发原因。
+    - 将 is_human_needed 置为 True，并将买家消息 + 触发上下文写入 ticket_data。
+    - 保持 state 其余字段原样返回，图拓扑将本节点直接导向 END。
+    - 后续阶段将在此处接入真实的工单创建 API 或客服告警推送。
+
+    Args:
+        state: LangGraph 全局共享状态（AgentState TypedDict）。
+
+    Returns:
+        dict: 仅更新 is_human_needed 和 ticket_data 两个字段的字典，
+              其余字段由 LangGraph add_messages reducer 自动保持。
     """
     pass

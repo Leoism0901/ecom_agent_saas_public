@@ -21,7 +21,7 @@ class AgentState(TypedDict):
     LangGraph 工作流全局共享状态
 
     本状态对象在 Agent 执行图的每个节点之间流转，各节点按需读取 / 写入字段。
-    三条属性的语义说明如下。
+    每条属性附带完整语义注释，说明来源、用途、流转链路与业务约束。
     """
 
     messages: Annotated[list[AnyMessage], add_messages]
@@ -75,7 +75,6 @@ class AgentState(TypedDict):
       预热 messages 列表（将 dict 转换为 LangChain 消息对象后追加到 messages）。
     """
 
-
     question: str
     """
     当前轮次的买家原始问题文本
@@ -83,8 +82,19 @@ class AgentState(TypedDict):
     由 run_agent() 在组装初始 State 时注入，对应 ChatService.process_chat()
     接收的 question 参数。LLM 节点在构建请求体 messages 数组时，
     将本条消息作为最后一条 role="user" 消息追加到列表末尾。
+    """
 
-    
+    session_id: str
+    """
+    当前会话的唯一标识（UUID 字符串）
+
+    来源为 Router 层传入或后端自动生成的会话 UUID，贯穿整个 Agent 工作流。
+    在长记忆压缩节点中用于定位 ChatLog 记录，以便将提炼出的结构化摘要
+    （summary / tags / emotion）持久化写入对应 session 的 metadata_json 字段。
+
+    与 chat_history 的区别：
+    - session_id：数据库 ChatLog 记录的会话关联键，用于持久化写入。
+    - chat_history：Redis 短期记忆中的历史消息快照，用于 LLM 上下文注入。
     """
 
     summary: str
@@ -96,7 +106,41 @@ class AgentState(TypedDict):
     摘要文本存入本字段，供后续 LLM 调用时作为上下文前缀注入，
     实现「长记忆压缩」机制，在控制 Token 消耗的同时保留关键对话信息。
 
-    当前阶段（压缩节点尚未实现）：
+    当前阶段（压缩节点已实现）：
     - 本字段初始值为空字符串 ""，由 run_agent() 在组装初始 State 时注入。
-    - 后续阶段将在 compress_node 中将压缩结果回写到本字段。
+    - 压缩节点 summarize_memory 将提炼出的结构化 JSON 回写到本字段，
+      并持久化到 MySQL ChatLog.metadata_json 中。
+    """
+
+    is_human_needed: bool
+    """
+    人工接管触发标志位
+
+    当敏感词前置拦截（should_escalate_to_human 条件路由）检测到买家消息中
+    包含「诈骗」「投诉」「12315」「律师函」「工商」「维权」「消协」「法院」
+    等极端意图关键词时，由条件路由函数将其设为 True，并将图流转定向至
+    human_fallback_node，绕过 LLM 调用直接走人工流程。
+
+    - 默认值：False（正常流转，无需人工介入）。
+    - 设为 True 后，human_fallback_node 读取本标志位并生成工单数据写入 ticket_data。
+    """
+
+    ticket_data: dict
+    """
+    人工工单数据容器
+
+    当 is_human_needed 被触发后，由 human_fallback_node 生成的结构化工单信息，
+    包含但不限于：触发关键词、买家原始消息、会话 ID、租户 ID、时间戳等字段。
+
+    格式示例：
+        {
+            "trigger_keyword": "12315",
+            "user_message": "我要打12315投诉你们",
+            "session_id": "uuid-xxx",
+            "tenant_id": "888",
+            "created_at": "2026-06-17T10:30:00+08:00"
+        }
+
+    - 默认值：空字典 {}，由 run_agent() 在组装初始 State 时注入。
+    - 后续阶段可将本字段的数据写入 MySQL 工单表或推送到客服工作台。
     """

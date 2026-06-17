@@ -2,21 +2,27 @@
 LangGraph 工作流编排图 —— 初始化与编译模块
 
 本模块负责：
-1. 实例化 StateGraph，注册 LLM 生成节点与长记忆压缩占位节点。
-2. 编排节点间的拓扑连线（含条件分支：START → llm_generate → 条件路由 → END）。
+1. 实例化 StateGraph，注册 LLM 生成节点、长记忆压缩节点、人工接管兜底节点。
+2. 编排节点间的拓扑连线（含双重条件分支：敏感词前置拦截 + 长记忆压缩路由）。
 3. 编译为可执行的 LangGraph 应用实例（app）。
 4. 提供对外的异步执行封装函数 run_agent()，供 Router 层直接调用。
 
-当前阶段：【长记忆压缩第二阶段 —— 真实压缩节点落地】
+当前阶段：【Day 12 —— 人工接管前置拦截机制】
 - llm_generate_node 已接入真实大模型（豆包 1.6），支持 Tool-Calling 动态工具调用。
 - 多租户提示词（tenant_prompt）在节点内部作为 system 消息强制注入。
+- ★ 新增 should_escalate_to_human：敏感词前置拦截，检测买家消息中的极端意图关键词，
+  命中后短路绕过 LLM，直接导向 human_fallback_node → END。
 - 条件路由 should_compress_memory：消息数 ≥ 11 时触发压缩分支。
 - summarize_memory 为真实压缩节点：调用大模型提炼对话标签 → 合并 summary → 截断 messages。
+- human_fallback_node 为人工接管占位节点：生成工单数据，标记 is_human_needed=True。
 
 拓扑连线（当前）：
-    START → llm_generate_node → should_compress_memory (条件边)
-                                      ├── "continue" → END
-                                      └── "compress" → summarize_memory → END
+    START → should_escalate_to_human (条件边)
+              ├── "human_fallback" → human_fallback_node ────────────────→ END
+              └── "continue" → llm_generate_node
+                                  └── should_compress_memory (条件边)
+                                        ├── "continue" → END
+                                        └── "compress" → summarize_memory → END
 
 架构红线（遵循 CLAUDE.md）：
 - 本模块仅负责图结构编排，所有 LLM 调用与 Prompt 逻辑下沉至 Service 层。
@@ -30,6 +36,7 @@ from typing import Optional
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.nodes import (
+    human_fallback_node,
     llm_generate_node,
     summarize_memory,
 )
@@ -42,7 +49,58 @@ _logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 0. 条件路由函数 —— 长记忆压缩触发判断
+# 0. 条件路由函数 —— 敏感词前置拦截（Day 12 新增）
+#    在所有业务逻辑之前执行，检测极端意图关键词，命中即短路转人工。
+# ============================================================
+
+# 敏感词黑名单 —— 匹配即触发人工接管，绕过 LLM 调用
+_HUMAN_ESCALATION_KEYWORDS: frozenset = frozenset({
+    "诈骗",
+    "投诉",
+    "12315",
+    "律师函",
+    "工商",
+    "维权",
+    "消协",
+    "法院",
+    "起诉",
+    "假货",
+    "欺诈",
+})
+
+
+def should_escalate_to_human(state: AgentState) -> str:
+    """
+    敏感词前置拦截条件路由 —— 检测买家消息中是否包含极端意图关键词。
+
+    本函数是 LangGraph 工作流的第一道关卡，在 LLM 调用之前对买家消息
+    进行关键词扫描。若命中黑名单中的任一敏感词，立即短路返回
+    "human_fallback"，将图流转直接导向 human_fallback_node，
+    完全绕过 LLM 调用 —— 避免大模型对「我要打 12315 投诉」这类
+    高敏感消息生成不当回复，引发合规风险。
+
+    检测范围：
+    - 仅检测 state["question"]（当前轮次的买家原始问题文本）。
+    - 不做模糊匹配或语义分析，仅做精确子串包含检查（性能最优）。
+
+    设计考量：
+    - frozenset O(1) 成员检查虽然快，但这里需要子串匹配（"我要投诉你们"
+      包含"投诉"），因此仍采用逐关键词遍历 + in 操作符的方式。
+    - 关键词列表仅 11 个，遍历耗时 < 0.1ms，对用户体验无感知影响。
+    - 后续阶段可将本函数升级为 Embedding 语义分类器或小模型二分类器。
+
+    Args:
+        state: LangGraph 全局共享状态（AgentState TypedDict）。
+
+    Returns:
+        str: "human_fallback" —— 命中敏感词，短路转人工接管；
+             "continue"       —— 未命中，正常进入 LLM 生成节点。
+    """
+    pass
+
+
+# ============================================================
+# 1. 条件路由函数 —— 长记忆压缩触发判断
 #    检查 state["messages"] 长度，决定是否进入压缩分支
 # ============================================================
 
@@ -79,20 +137,31 @@ def should_compress_memory(state: AgentState) -> str:
 workflow = StateGraph(AgentState)
 
 # ============================================================
-# 2. 注册节点 —— 将 LLM 生成节点和压缩占位节点绑定到图中
+# 2. 注册节点 —— 将 LLM 生成节点、压缩节点、人工接管节点绑定到图中
 #    后续阶段新增节点（如 intent_classifier_node、rag_retrieval_node）
 #    也在此处注册，并配合条件边实现复杂拓扑
 # ============================================================
 workflow.add_node("llm_generate_node", llm_generate_node)
 workflow.add_node("summarize_memory", summarize_memory)
+workflow.add_node("human_fallback_node", human_fallback_node)
 
 # ============================================================
-# 3. 编排拓扑连线（条件分支拓扑）
+# 3. 编排拓扑连线（双重条件分支拓扑 —— Day 12 升级）
 #
 #    当前连线：
-#    START → llm_generate_node → should_compress_memory (条件边)
-#                                      ├── "continue" → END
-#                                      └── "compress" → summarize_memory → END
+#    START → should_escalate_to_human (条件边)
+#              ├── "human_fallback" → human_fallback_node ────────────────→ END
+#              └── "continue" → llm_generate_node
+#                                  └── should_compress_memory (条件边)
+#                                        ├── "continue" → END
+#                                        └── "compress" → summarize_memory → END
+#
+#    拓扑设计原理（Day 12 新增 —— 人工接管前置拦截）：
+#    - should_escalate_to_human 是工作流的第一道关卡，在 LLM 调用之前执行。
+#    - 若买家消息包含「诈骗」「投诉」「12315」「律师函」等极端关键词，
+#      立即短路导向 human_fallback_node，完全绕过 LLM。
+#    - human_fallback_node 执行完毕后直接 END，不进入后续任何节点。
+#    - 若未命中敏感词，正常进入 llm_generate_node → should_compress_memory 路径。
 #
 #    llm_generate_node 内部已实现完整闭环：
 #    Prompt 注入 → LLM 调用 → 工具执行（可选）→ 最终文本回复
@@ -104,14 +173,29 @@ workflow.add_node("summarize_memory", summarize_memory)
 #    summarize_memory 执行真实的长记忆压缩逻辑：
 #    消息转换 → 大模型标签提炼 → summary 合并 → messages 截断 → END
 #
+#    human_fallback_node 为人工接管兜底占位：
+#    检测到极端意图后，生成工单数据（ticket_data），标记 is_human_needed=True → END
+#
 #    后续阶段将改造为多节点条件拓扑：
 #    START → intent_classifier ─┬─ logistics ─→ check_logistics ─→ END
 #                                ├─ product ───→ rag_retrieval ───→ END
 #                                └─ chitchat ───→ llm_generate ────→ END
 # ============================================================
-workflow.add_edge(START, "llm_generate_node")
 
-# ---- 条件边：LLM 节点执行完毕后，按消息数量决定下一步 ----
+# ---- 条件边（第一道关卡）：START 后先执行敏感词拦截 ----
+workflow.add_conditional_edges(
+    START,
+    should_escalate_to_human,
+    {
+        "human_fallback": "human_fallback_node",  # 命中敏感词 → 人工接管
+        "continue": "llm_generate_node",          # 未命中 → 正常进入 LLM 节点
+    },
+)
+
+# ---- 人工接管节点执行完毕后直接结束（不经过 LLM 链路） ----
+workflow.add_edge("human_fallback_node", END)
+
+# ---- 条件边（第二道关卡）：LLM 节点执行完毕后，按消息数量决定下一步 ----
 workflow.add_conditional_edges(
     "llm_generate_node",
     should_compress_memory,
