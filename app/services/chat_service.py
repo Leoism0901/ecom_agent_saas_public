@@ -191,7 +191,7 @@ async def get_chat_logs(
     Args:
         db:        由 get_db() 注入的异步数据库会话
         tenant_id: 租户唯一标识，由 Router 从 X-Tenant-ID Header 提取后传入
-        limit:     返回的最大记录数（默认 50，防止一次返回过多数据拖垮接口）
+        limit:     返回的最大记录数（默认 50，防止一次返回过多数据）
 
     Returns:
         ChatLog ORM 实例序列（仅包含当前租户的数据，可能为空序列）
@@ -219,6 +219,50 @@ async def get_chat_log_by_id(
 
     Returns:
         ChatLog ORM 实例（存在且归属当前租户时）或 None（不存在或不属于当前租户）
+    """
+    pass
+
+
+async def append_summary_to_metadata(
+    db: AsyncSession,
+    session_id: str,
+    extraction_data: dict,
+    tenant_id: str = "",
+) -> bool:
+    """
+    将长记忆压缩提炼的结构化数据合并写入 ChatLog.metadata_json。
+
+    本函数是「长记忆压缩」机制的最后一步 —— 将大模型提炼出的
+    summary / tags / emotion 三字段结构持久化到 MySQL，实现跨会话的
+    长记忆积累。后续 Agent 运行时可通过读取 metadata_json 获取买家
+    历史画像（情绪轨迹、标签积累、诉求摘要）。
+
+    合并策略（绝不覆盖原有整个字典）：
+    1. 根据 session_id（+ tenant_id 双重校验）查询 ChatLog 记录。
+    2. 读取记录中已有的 metadata_json 字段（可能为 None 或 dict）。
+    3. 将 extraction_data 中的键值对**浅层合并**到原有字典中 ——
+       新键直接添加，已存在的键用新值覆盖，其余旧键完整保留。
+    4. 异步 commit 持久化，失败时 rollback 并返回 False。
+
+    多租户安全：
+    - 若传入了 tenant_id，WHERE 条件同时包含 session_id 和 tenant_id，
+      防止跨租户数据污染。
+    - 若未传 tenant_id（向后兼容），仅按 session_id 查询。
+
+    降级策略：
+    - ChatLog 记录不存在 → 记录 Warning 日志，返回 False（不抛异常）。
+    - metadata_json 为空或非 dict → 视为空字典，从零开始合并。
+    - 数据库异常 → rollback + 记录 Error 日志，返回 False。
+
+    Args:
+        db:              由调用方传入的异步数据库会话。
+        session_id:      会话 UUID，用于定位 ChatLog 记录。
+        extraction_data: 大模型提炼出的结构化字典，
+                        如 {"summary": "...", "tags": [...], "emotion": "焦虑"}。
+        tenant_id:       可选 —— 租户唯一标识（字符串），用于多租户双重校验。
+
+    Returns:
+        bool: True 表示持久化成功，False 表示失败（记录不存在或数据库异常）
     """
     pass
 

@@ -109,14 +109,17 @@ async def summarize_memory(state: AgentState) -> dict:
             （买家的原始提问），确保后续 LLM 调用的上下文窗口
             不会被无限膨胀的消息历史撑爆。
 
+    步骤 5：将提炼出的结构化摘要持久化写入 MySQL ChatLog.metadata_json
+            独立创建 DB 会话完成存储，存储失败仅告警不阻断主流程。
+
     降级策略（三层兜底，逐层加固）：
     - 第一层：extract_conversation_tags 内部已兜底，返回合法三字段 JSON
     - 第二层：步骤 3 每个字段独立 try-except，解析失败用空值填充
-    - 第三层：整体 try-except，确保任何情况下返回合法 JSON 不崩溃
+    - 第三层：整体 try-except，数据库持久化异常静默降级，确保任何情况下返回合法 JSON 不崩溃
 
     Args:
         state: LangGraph 全局共享状态（AgentState TypedDict），
-               包含 messages、summary、tenant_id 等字段。
+               包含 messages、summary、tenant_id、session_id 等字段。
 
     Returns:
         dict: 符合 LangGraph StateGraph 节点规范的返回字典，
