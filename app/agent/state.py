@@ -83,4 +83,20 @@ class AgentState(TypedDict):
     由 run_agent() 在组装初始 State 时注入，对应 ChatService.process_chat()
     接收的 question 参数。LLM 节点在构建请求体 messages 数组时，
     将本条消息作为最后一条 role="user" 消息追加到列表末尾。
+
+    
+    """
+
+    summary: str
+    """
+    长记忆压缩摘要字段
+
+    用于存放压缩后的会话摘要文本。当 state["messages"] 列表长度
+    超过阈值（≥ 11 条）时，由压缩节点将历史消息压缩为一段精炼的
+    摘要文本存入本字段，供后续 LLM 调用时作为上下文前缀注入，
+    实现「长记忆压缩」机制，在控制 Token 消耗的同时保留关键对话信息。
+
+    当前阶段（压缩节点尚未实现）：
+    - 本字段初始值为空字符串 ""，由 run_agent() 在组装初始 State 时注入。
+    - 后续阶段将在 compress_node 中将压缩结果回写到本字段。
     """

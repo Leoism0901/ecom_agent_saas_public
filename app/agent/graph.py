@@ -2,15 +2,21 @@
 LangGraph 工作流编排图 —— 初始化与编译模块
 
 本模块负责：
-1. 实例化 StateGraph，注册 LLM 生成节点。
-2. 编排节点间的拓扑连线（当前为单节点直连：START → llm_generate → END）。
+1. 实例化 StateGraph，注册 LLM 生成节点与长记忆压缩占位节点。
+2. 编排节点间的拓扑连线（含条件分支：START → llm_generate → 条件路由 → END）。
 3. 编译为可执行的 LangGraph 应用实例（app）。
 4. 提供对外的异步执行封装函数 run_agent()，供 Router 层直接调用。
 
-当前阶段：【LLM 集成阶段】
+当前阶段：【长记忆压缩第一阶段 —— 状态扩展 + 触发条件】
 - llm_generate_node 已接入真实大模型（豆包 1.6），支持 Tool-Calling 动态工具调用。
 - 多租户提示词（tenant_prompt）在节点内部作为 system 消息强制注入。
-- 后续阶段将扩展为条件分支拓扑（意图分类 → 分流 → 工具执行 → 回复生成）。
+- 新增条件路由 should_compress_memory：消息数 ≥ 11 时触发压缩分支。
+- dummy_compress_node 为占位节点，后续阶段将替换为真正的长记忆压缩逻辑。
+
+拓扑连线（当前）：
+    START → llm_generate_node → should_compress_memory (条件边)
+                                      ├── "continue" → END
+                                      └── "compress" → dummy_compress_node → END
 
 架构红线（遵循 CLAUDE.md）：
 - 本模块仅负责图结构编排，所有 LLM 调用与 Prompt 逻辑下沉至 Service 层。
@@ -33,34 +39,112 @@ from app.agent.state import AgentState
 # ============================================================
 _logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# 0. 条件路由函数 —— 长记忆压缩触发判断
+#    检查 state["messages"] 长度，决定是否进入压缩分支
+# ============================================================
+
+def should_compress_memory(state: AgentState) -> str:
+    """
+    长记忆压缩触发条件判断 —— 基于消息列表长度的条件路由函数。
+
+    检查 state["messages"] 的当前累积长度。若消息数达到或超过阈值
+    （11 条），说明对话上下文已积累足够多的历史消息，需要触发长记忆
+    压缩流程，将冗余的历史消息压缩为一段精炼的摘要文本。
+
+    阈值设计依据（11 条）：
+    - 单轮纯文本对话（无工具调用）：每轮产生 2 条消息
+      （1 条 HumanMessage + 1 条 AIMessage），约 5 轮后达到阈值。
+    - 单轮工具调用对话：每轮可产生 4+ 条消息
+      （HumanMessage + AIMessage(tool_call) + ToolMessage + AIMessage），
+      约 2~3 轮后即达到阈值。
+    - 11 条是一个经验阈值，在 LLM 上下文窗口仍然宽裕时提前触发压缩，
+      避免消息无限膨胀导致 Token 超限或推理质量下降。
+
+    Args:
+        state: LangGraph 全局共享状态（AgentState TypedDict）。
+
+    Returns:
+        str: "compress" —— 消息数 ≥ 11，需触发长记忆压缩；
+             "continue" —— 消息数 < 11，正常结束，跳过压缩。
+    """
+    pass
+
+
+async def dummy_compress_node(state: AgentState) -> dict:
+    """
+    长记忆压缩占位节点 —— 后续阶段将替换为真正的压缩逻辑。
+
+    当前阶段仅为满足条件边（conditional edge）的拓扑完整性而存在，
+    不执行任何实际的压缩操作。仅打印一条醒目的占位日志表明已进入
+    压缩分支，然后原样返回空字典（不对 state 做任何修改）。
+
+    后续阶段（compress_node 真正实现时）将在此处：
+    1. 从 state["messages"] 中提取历史消息。
+    2. 调用大模型将历史消息压缩为一段精炼摘要。
+    3. 将摘要写入 state["summary"] 字段。
+    4. 截断 state["messages"]，仅保留最近 N 条消息。
+
+    Args:
+        state: LangGraph 全局共享状态（AgentState TypedDict）。
+
+    Returns:
+        dict: 空字典，表示不对 state 做任何字段修改。
+    """
+    pass
+
+
 # ============================================================
 # 1. 实例化 StateGraph —— 绑定 AgentState 作为全局状态容器
 # ============================================================
 workflow = StateGraph(AgentState)
 
 # ============================================================
-# 2. 注册节点 —— 将 LLM 生成节点绑定到图中
+# 2. 注册节点 —— 将 LLM 生成节点和压缩占位节点绑定到图中
 #    后续阶段新增节点（如 intent_classifier_node、rag_retrieval_node）
 #    也在此处注册，并配合条件边实现复杂拓扑
 # ============================================================
 workflow.add_node("llm_generate_node", llm_generate_node)
+workflow.add_node("dummy_compress_node", dummy_compress_node)
 
 # ============================================================
-# 3. 编排拓扑连线（当前为单节点直连拓扑）
+# 3. 编排拓扑连线（条件分支拓扑）
 #
 #    当前连线：
-#    START → llm_generate_node → END
+#    START → llm_generate_node → should_compress_memory (条件边)
+#                                      ├── "continue" → END
+#                                      └── "compress" → dummy_compress_node → END
 #
 #    llm_generate_node 内部已实现完整闭环：
 #    Prompt 注入 → LLM 调用 → 工具执行（可选）→ 最终文本回复
 #
-#    后续阶段将改造为条件分支拓扑：
+#    should_compress_memory 在 LLM 节点执行完毕后检查消息数量：
+#    - 消息数 < 11  → 路由到 END，正常结束
+#    - 消息数 ≥ 11  → 路由到 dummy_compress_node（占位），再进入 END
+#
+#    dummy_compress_node 当前为占位实现，仅打印日志并透传 state，
+#    后续阶段将替换为真正的长记忆压缩逻辑。
+#
+#    后续阶段将改造为多节点条件拓扑：
 #    START → intent_classifier ─┬─ logistics ─→ check_logistics ─→ END
 #                                ├─ product ───→ rag_retrieval ───→ END
 #                                └─ chitchat ───→ llm_generate ────→ END
 # ============================================================
 workflow.add_edge(START, "llm_generate_node")
-workflow.add_edge("llm_generate_node", END)
+
+# ---- 条件边：LLM 节点执行完毕后，按消息数量决定下一步 ----
+workflow.add_conditional_edges(
+    "llm_generate_node",
+    should_compress_memory,
+    {
+        "continue": END,                   # 消息数不足 11 条，正常结束
+        "compress": "dummy_compress_node",  # 消息数 ≥ 11 条，进入压缩节点
+    },
+)
+
+# ---- 压缩节点执行完毕后进入结束 ----
+workflow.add_edge("dummy_compress_node", END)
 
 # ============================================================
 # 4. 编译图 —— 生成可供外部调用的 LangGraph 应用实例
