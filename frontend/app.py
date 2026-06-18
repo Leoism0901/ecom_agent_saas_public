@@ -1,37 +1,41 @@
 """
 Streamlit 极速沙盒骨架 —— 电商多租户智能售后 Agent SaaS 演示前端界面
-迭代版本：Day 13 Step1+Step2，新增完整会话状态生命周期管理层
+迭代版本：Day 13 Step1+Step2+Step3，新增完整聊天交互Mock闭环
 
 完整分层架构拓扑：
 1. 页面全局基础配置（宽屏、标题、图标，强制首行执行）
-2. SessionState 状态管理层（独立模块，解耦UI渲染）
+2. SessionState 状态管理层（独立模块，与UI渲染解耦）
    - init_session_state：幂等初始化四大核心会话字段
-   - reset_session：精准重置会话上下文，区分租户切换/清空会话两种场景
+   - reset_session：精准重置会话上下文，区分清空会话/切换租户场景
    - 联动逻辑：租户切换自动重置会话、清空按钮绑定重置回调
 3. 侧边栏全局操作台：租户下拉切换、会话清空操作、扩展分割线
 4. 主体6:4双栏布局
-   - 左栏60%：买家对话交互面板，承载完整聊天消息流
-   - 右栏40%：LangGraph工作流监控面板，展示节点日志、工单、情绪标签
+   - 左栏60%：完整买家聊天交互面板
+     1. 历史对话气泡渲染
+     2. 底部聊天输入框
+     3. Mock模拟对话闭环流程（模拟推理延迟、组装回复、刷新页面）
+   - 右栏40%：LangGraph工作流监控面板，预留日志展示位
 
 硬性工程规范（遵循项目CLAUDE.md）：
-1. 仅使用Streamlit原生组件，无第三方前端框架、无JS依赖
+1. 仅使用Streamlit原生组件，无第三方前端框架、JS依赖
 2. 全文件函数、变量强制Type Hints类型标注
 3. 全量中文注释+标准Docstring，分层职责、执行时序、设计思路完整说明
 4. 状态管理与UI渲染完全分层隔离，单一职责原则
-5. 当前仅静态骨架+状态机定义，无任何后端FastAPI、Service、LLM网络交互逻辑
-6. 所有会话Key统一常量托管，避免硬编码字符串拼写错误
+5. 当前仅静态骨架+状态机+聊天交互流程定义，无任何后端FastAPI、Service、LLM真实网络请求
+6. 会话Key、页面文案、模板、延迟参数全部抽离顶层常量，统一管控避免硬编码
 
 项目启动命令：
 streamlit run frontend/app.py
 """
 from __future__ import annotations
 
+import time
 import uuid
 import streamlit as st
 
 # ============================================================================
 # 全局静态常量统一托管层
-# 文案、布局比例、会话状态键名、页面配置全部抽离顶层常量
+# 租户数据、页面配置、侧边栏文案、聊天模板、布局比例、会话键名全部抽离
 # ============================================================================
 # 模拟租户数据源，生产环境由后端租户接口动态拉取
 SIMULATED_TENANTS: list[str] = []
@@ -43,11 +47,15 @@ PAGE_LAYOUT: str = ""
 SIDEBAR_TITLE: str = ""
 TENANT_SELECT_LABEL: str = ""
 CLEAR_SESSION_BTN_LABEL: str = ""
-# 左右面板占位文案
+# 聊天面板文案常量
 LEFT_COL_TITLE: str = ""
-LEFT_PLACEHOLDER: str = ""
+CHAT_INPUT_PLACEHOLDER: str = ""
 RIGHT_COL_TITLE: str = ""
 RIGHT_PLACEHOLDER: str = ""
+# Mock对话模拟相关常量（模板、延迟、输入截取长度）
+MOCK_REPLY_TEMPLATE: str = ""
+MOCK_LATENCY_SECONDS: float = 0.0
+MOCK_SNIPPET_MAX_LEN: int = 0
 # 双栏固定布局比例
 LEFT_RATIO: float = 0.0
 RIGHT_RATIO: float = 0.0
@@ -87,7 +95,7 @@ def reset_session() -> None:
 
 
 # ============================================================================
-# UI分层渲染函数（纯页面渲染，无业务交互、无后端请求）
+# UI分层渲染函数（纯页面渲染流程，无可运行业务、无后端调用）
 # ============================================================================
 def build_sidebar() -> None:
     """
@@ -105,9 +113,15 @@ def build_sidebar() -> None:
 
 def build_left_panel(col_handle: st.delta_generator.DeltaGenerator) -> None:
     """
-    左侧买家交互面板渲染函数
-    业务定位：承载完整对话消息流、用户输入框、AI回复展示
-    当前阶段：仅占位提示，后续对接聊天消息渲染逻辑
+    左侧买家完整聊天交互面板渲染函数（Step3新增Mock对话闭环）
+    面板分层渲染逻辑：
+    1. 面板标题
+    2. 遍历会话消息列表，渲染用户/AI两侧聊天气泡
+    3. 底部固定聊天输入框，接收用户输入
+    标准化Mock对话闭环流程：
+    用户提交输入 → 写入用户消息 → 模拟推理延迟 → 填充模板生成AI回复
+    → 写入AI消息 → 页面强制刷新展示新对话
+
     Args:
         col_handle: 分栏容器句柄，限定组件渲染范围
     """
@@ -119,6 +133,7 @@ def build_right_panel(col_handle: st.delta_generator.DeltaGenerator) -> None:
     右侧Agent工作流监控面板渲染函数
     业务定位：展示LangGraph节点流转、工单结构化数据、用户情绪标签、工具调用记录
     当前阶段：JSON格式占位，后续对接后端实时日志推送
+
     Args:
         col_handle: 分栏容器句柄，限定组件渲染范围
     """
