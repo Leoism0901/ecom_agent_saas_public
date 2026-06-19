@@ -1,46 +1,47 @@
 """
-电商 SaaS AI Agent 平台 —— FastAPI 应用入口
+电商 SaaS AI Agent 平台 —— FastAPI 应用入口【面试脱敏骨架版】
+本文件仅保留初始化分层规范、架构约束注释、模块导入顺序契约，所有环境变量解析、跨域配置、路由挂载、健康检查执行逻辑全部置空pass，无真实服务启动落地代码，仅用于面试展示后端项目顶层初始化设计思路，无法直接部署运行。
 
-本模块是整个后端服务的启动中枢，职责仅为：
-1. 在应用初始化第一时间加载 .env 环境变量（确保后续所有模块能读到配置）
-2. 创建 FastAPI 实例并配置 CORS 跨域中间件（为 Streamlit 前端沙盒做准备）
-3. 挂载所有业务路由模块（tenant_router / chat_router）
+本模块后端顶层启动文件标准化职责（架构文档完整留存）：
+1. 应用加载最优先执行 .env 环境变量加载，保证全项目模块统一读取配置
+2. FastAPI主实例初始化 + CORS跨域中间件配置规范，适配Streamlit前端沙盒跨域访问
+3. 统一挂载全业务分组路由，路由前缀、标签下沉各router内部，main仅做聚合挂载
 
-架构红线：
-- 严禁在 main.py 中编写任何业务逻辑、模型定义或数据库操作
-- 所有配置项必须从 .env 环境变量读取，绝对禁止硬编码
-- 路由注册使用 app.include_router()，前缀和 tags 在各自 Router 文件中定义
+顶层架构硬性红线约束（项目强制规范）：
+- main.py 仅做初始化聚合，禁止写入任何业务逻辑、ORM模型、数据库读写代码
+- 全部配置参数统一从.env环境变量读取，代码中禁止任何硬编码域名、密钥、端口
+- 路由统一使用 app.include_router 挂载，路径前缀、tags在各路由文件内部定义，顶层入口不重复维护路由信息
 
-启动命令：
+标准启动命令规范（仅文档留存，无执行逻辑）：
     uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-
-访问 Swagger 文档：
+API文档访问地址规范：
     http://127.0.0.1:8000/docs
 """
 
 # ============================================================
-# 🔒 第一优先级：环境变量加载（必须在所有业务模块导入之前执行）
-#    确保 app.database / app.services 等下游模块在 import 时已能读取到 .env 配置
+# 🔒 加载顺序强约束：环境变量必须最先加载，在所有业务模块导入前执行
+# 设计目的：保证 database / service / router 等下游模块导入时可正常读取.env配置项
 # ============================================================
 from dotenv import load_dotenv
 
-load_dotenv()  # 显式加载项目根目录 .env 文件，任何下游模块导入前必须完成
+load_dotenv()  # 标准化前置加载步骤，导入顺序不可调换
 
-import os  # noqa: E402 — 紧跟 load_dotenv() 之后，用于读取环境变量
+import os  # noqa: E402 — 紧随环境变量加载，用于读取全局环境配置
 
 # ============================================================
-# FastAPI 核心与中间件
+# FastAPI 框架核心、中间件依赖导入规范
 # ============================================================
 from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 # ============================================================
-# 业务路由模块导入
+# 全业务路由模块统一导入聚合
 # ============================================================
-from app.routers import chat_router, tenant_router  # noqa: E402
+from app.routers import admin_router, chat_router, tenant_router  # noqa: E402
 
 # ============================================================
-# FastAPI 应用实例
+# FastAPI 应用实例初始化规范（仅定义参数契约，无实例构建落地逻辑）
+# 应用元数据：项目名称、功能简介、版本、文档访问路径统一声明
 # ============================================================
 app = FastAPI(
     title="电商 SaaS AI Agent 平台",
@@ -50,53 +51,47 @@ app = FastAPI(
         "提供会话日志写入/查询、RAG 知识检索、LLM 意图识别等核心能力。"
     ),
     version="0.1.0",
-    docs_url="/docs",        # Swagger UI 路径
-    redoc_url="/redoc",      # ReDoc 路径
+    docs_url="/docs",        # Swagger UI 标准访问路径
+    redoc_url="/redoc",      # ReDoc 轻量化文档路径
 )
 
 # ============================================================
-# CORS 跨域中间件配置
-# 当前阶段：允许所有来源（为 Streamlit 前端沙盒开发提供便利）
-# 生产环境：务必通过 .env 的 CORS_ORIGINS 变量限定为具体域名
+# CORS 跨域中间件配置标准化契约
+# 开发/生产环境区分设计规范：
+# 开发沙盒阶段允许全部域名；生产环境由.env CORS_ORIGINS 限定可信域名
+# 支持逗号分割多域名配置解析规则定义
 # ============================================================
-CORS_ORIGINS_RAW: str = os.getenv("CORS_ORIGINS", "*")
-# 支持逗号分隔的多域名，如 "http://localhost:3000,http://localhost:8501"
-if CORS_ORIGINS_RAW == "*":
-    allowed_origins = ["*"]
-else:
-    allowed_origins = [origin.strip() for origin in CORS_ORIGINS_RAW.split(",") if origin.strip()]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],    # 允许所有 HTTP 方法（GET / POST / PUT / DELETE / OPTIONS）
-    allow_headers=["*"],    # 允许所有请求头（包括 X-Tenant-ID 自定义 Header）
-)
+# 读取跨域配置原始环境变量字符串
+pass
+# 域名解析分支逻辑：通配符* / 多域名分割处理规范
+pass
+# 注册跨域中间件，允许凭证、全部请求方法、全部自定义请求头（兼容X-Tenant-ID）
+pass
 
 # ============================================================
-# 路由注册
+# 全业务路由统一挂载规范
+# 各路由独立管控prefix与tags，main仅做聚合挂载，职责单一
+# 路由业务边界注释完整留存：
+# chat_router：会话日志CRUD多租户接口
+# tenant_router：商户入驻、租户基础管理接口
+# admin_router：平台管理大盘、管理员新建租户运维接口
 # ============================================================
-app.include_router(chat_router.router)    # /api/v1/chats  —— 会话日志 CRUD（多租户隔离）
-app.include_router(tenant_router.router)  # /api/v1/tenants —— 租户管理（平台运维接口）
-
+pass
+pass
+pass
 
 # ============================================================
-# 健康检查端点（Kubernetes liveness / readiness probe 就绪）
+# 系统健康检查接口契约（适配K8s容器就绪/存活探针）
 # ============================================================
 @app.get("/health", tags=["System"])
 async def health_check():
     """
-    服务健康检查接口
+    服务健康探测标准接口
+    业务用途：
+    1. Kubernetes liveness / readiness 容器健康探针
+    2. 开发调试快速校验后端服务是否正常启动
 
-    用于容器编排系统（K8s）的 liveness / readiness 探测，
-    以及开发阶段快速验证服务是否已成功启动。
-
-    Returns:
-        {"status": "ok", "version": "0.1.0"}
+    标准化返回结构契约：
+        {"status": "ok", "version": "0.1.0", "title": "项目名称"}
     """
-    return {
-        "status": "ok",
-        "version": app.version,
-        "title": app.title,
-    }
+    pass
